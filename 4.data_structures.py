@@ -1,5 +1,8 @@
 '''
-1.List 
+1. List - ordered & mutable ( list element's value can be changed ) 
+2. Tuple - ordered & immutable
+3. Dictionary - {key:value} pair & unordered
+4. Set - unordered &  non repeatative elements
 '''
 
 # LIST:-
@@ -58,7 +61,7 @@ for i in range(n):
     LIST.append(element)
 print(LIST)'''
 
-LIST = [1,11, 21, 13, 44,121, 5]
+# LIST = [1,11, 21, 13, 44,121, 5]
 # LIST.clear()
 # print(LIST)
 
@@ -83,7 +86,8 @@ LIST = [1,11, 21, 13, 44,121, 5]
 # LIST.pop(1)
 # print(LIST)
 
-LIST.sort(reverse=True)
+
+'''LIST.sort(reverse=True)
 print(LIST)
 
 
@@ -91,4 +95,61 @@ def last(l):
     return l[-1]
 ls = [[5,4,5],[3,2,1],[1,7,4]]
 ls.sort(key= last)
-print(ls)
+print(ls)'''
+
+
+
+# TUPLE
+t = (1,2,3,4,5)
+# print(t)
+# print(type(t))
+# print(type(t[0]))
+
+'''t1 = ('a',55,'s',1,4.012)
+print(t1)
+print(t1[0])
+print(t1[-1])'''
+
+
+'''# slicing
+print(t1[:])
+print(t1[1:])
+print(t1[2:4])'''
+
+'''
+t1 = ('a',55,'s',1,4.012)
+t1[0] = 555'''
+
+'''Lis = [1,'sss',[1,2,[4,5,(5,6)],5],('pg','sp'),45]
+print(Lis)'''
+
+
+'''# DICTIONARY
+
+D = {'Name':'Gajanan','Age':45}
+# print(D)
+# print(type(D))
+# print(D.keys())
+# print(D.values())
+
+D['Salary'] = 'bhetnar nai'
+# print(D)
+
+# print(D.items())
+
+
+# user defined dictionary
+dictionary = {}
+for i in range(3):
+    print('enter key')
+    key = input()
+    print('enter value')
+    value = input()
+    dictionary[key] = value
+print(dictionary)'''
+
+# SET
+Li = [1,2,3,1,2]
+Li = set(Li)
+
+print(type(Li))
