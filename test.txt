@@ -1,2 +1,1290 @@
-hi there
-How u doing
+/*******************************************************************************
+ * File Name      : cmdhandler.c
+ * Description    : command handler
+ ******************************************************************************/
+/* Includes ------------------------------------------------------------------*/
+#include <xc.h>
+#include "standardtypes.h"
+#include "version.h"
+#include "cal_crc.h"
+#include "timing.h"
+#include "uart.h"
+#include "gpio.h"
+#include "pwm.h"
+#include "charleds.h"
+#include "cmdhandler.h"
+#include "uiMenus.h"
+#include "uiOptions.h"
+#include "uiJets.h"
+#include "uiTemperature.h"
+#include "uiAce.h"
+#include <stdlib.h>
+
+#define RS422_MAX_RECOVERY_COUNT    3
+
+#define EAGLE422_FRAME_SIZE         8               // same for all 485 protocols
+//TODO
+#define EAGLE422_MAX_PAYLOAD_LEN    256             // same for all protocols
+#define EAGLE422_PAD_SIZE           5               // 5 extra bytes to avoid any potential overflows
+#define EXPECTED_RESPONSE_TIME      (ONE_MS * 1000)	// spec says 26ms but that is our clock granularity so we must wait at least 30ms
+#define MAX_EAGLE422_RETRIES        2//No Retries, matching to Eagle_MX system
+#define MAX_EAGLE422_MSGS           4//20              // per protocol (there are 4)
+//#define MAX_EAGLE422_MSGS_SIZE      (EAGLE422_MAX_PAYLOAD_LEN+EAGLE422_FRAME_SIZE+EAGLE422_PAD_SIZE)
+#define MAX_EAGLE422_MSGS_SIZE      (36+EAGLE422_FRAME_SIZE+EAGLE422_PAD_SIZE)
+
+static unsigned char eagle_tx_queue[MAX_EAGLE422_MSGS][MAX_EAGLE422_MSGS_SIZE];
+/* Private typedef -----------------------------------------------------------*/
+typedef struct
+{
+    tSW_TIMER timeout_timer;
+    u8 state;
+    u8 *ptr;
+    u8 buffer[UART_MAX_RX_BUF_SIZE];
+    u8 reason_for_reset; // for debug
+    u16 data_len;
+    u16 payload_size;
+    u8 crc;
+    u8 calc_crc;
+    u8 use_crc_check : 1;
+    
+    int tx_Qin;
+    int tx_Qout;
+    int tx_Retry;
+
+} tPKT;
+
+/* Private define ------------------------------------------------------------*/
+//XMIT - Packet Handler States
+enum
+{
+    XMIT_DEST, XMIT_SRC, XMIT_LEN_HI, XMIT_LEN_LO, XMIT_DATA,
+    XMIT_CRC_HI, XMIT_CRC_LO, XMIT_COMPLETE
+};
+//comand monitor states
+typedef enum
+{
+    STATE_IDLE, STATE_TX_PKT, STATE_RX_PKT, STATE_FAULT
+} eagle422_state_type;
+/* Private macro -------------------------------------------------------------*/
+/* Private variables ---------------------------------------------------------*/
+bool global_status_received = false;
+bool screen_brightness_received = false;
+bool heat_mode_status_received = false;
+bool Lights_Status_received = false;
+tSW_TIMER system_status_timer;
+u8 rx_buf[UART_MAX_RX_BUF_SIZE];
+tPKT cmd_tx, cmd_rx;
+u8 handle_count;
+int comm_detected;
+extern u16 key_image;
+extern int sys_clock_cal;
+extern unsigned char cal_time_flag;
+bool send_system_status_cmd = TRUE;
+float set_temperature;
+/*******************************************************************************
+ * Function Name  : cmd_init()
+ * Description    : initialises for command handler
+ * Input          : None
+ * Output         : None
+ * Return         : None
+ ******************************************************************************/
+void cmd_init(void)
+{
+    // Set options
+	cmd_rx.use_crc_check = TRUE;
+    
+    // Register callback for receive handler
+    register_uart2_rx(cmd_RxHandler, rx_buf, UART_MAX_RX_BUF_SIZE);
+    uart_set_idle_line_timeout(MIN_INTER_MSG_TIME);
+}
+
+/*******************************************************************************
+ * Function Name  : cmdHandler()
+ * Description    : command processing
+ * Input          : None
+ * Output         : None
+ * Return         : None
+ ******************************************************************************/
+
+void cmd_Monitor(void)
+{
+    u8 status;
+    unsigned char *xmitptr;
+    unsigned int len;
+    static unsigned char MsgType=0;
+    static u8 recoveryFailCount = 0;
+    
+    uart2_monitor();
+    
+    switch(cmd_tx.state){
+        
+        case STATE_IDLE:
+            if (cmd_tx.tx_Qout != cmd_tx.tx_Qin  /*&& fn_v_Get_422_UART_Idle_Line_Timeout()*/)
+            {
+                xmitptr = cmd_tx_QPop(&len); 
+                //start the transmission
+                uart0_send(xmitptr, len, cmd_XmitDone);
+                
+                if(xmitptr[FLAGS_INDEX] & REQUEST_FLAG)
+                    MsgType = REQUEST_FLAG;
+                else if (xmitptr[FLAGS_INDEX] & RESPONSE_FLAG)
+                    MsgType = RESPONSE_FLAG;
+                //change state
+                cmd_tx.state = STATE_TX_PKT;
+            }
+            else
+            {
+                //TODO
+                send_system_status_cmd = TRUE;
+            }
+            
+            if(timerExpired(&system_status_timer))
+            {
+                if(send_system_status_cmd /*&& head_setup.hasVersion*/)
+                {
+                    send_system_status_cmd = FALSE;
+                    cmd_txSendPacket(EAGLE_REQUEST, EAGLE_ADDRESS, OBJ_ID_06,SYSTEM_STATUS_CMD ,NULL, 0);
+                    timerInit(&system_status_timer, ONE_MS*500);
+                }  
+            }
+            break;
+        case STATE_TX_PKT:
+            cmd_tx.state = STATE_IDLE;
+            timerInit(&cmd_tx.timeout_timer, EXPECTED_RESPONSE_TIME);
+
+            if(MsgType == REQUEST_FLAG)
+                cmd_tx.state = STATE_RX_PKT;
+            else if(MsgType == RESPONSE_FLAG)
+            {
+                cmd_tx.state = STATE_IDLE;
+                cmd_tx_QAdvance();  // Advance TX queue
+            }
+            break;
+        case STATE_RX_PKT:
+            
+            if (cmd_rx.state == RCV_PKT_READY)
+            {
+                head_setup.noUpdateResponseFromEagle = 0;
+                status = ProcessRxCommand();
+                cmd_ResetRxHandler(status);
+                // Check for NAK
+                if(status == RCV_PKT_NO_ERROR)
+                { 
+                    //cmd_tx_QAdvance();
+                    cmd_tx.tx_Retry = 0;
+                    recoveryFailCount = 0;
+                    cmd_tx.state = STATE_IDLE;
+                }
+                else if(cmd_tx.tx_Retry >= MAX_EAGLE422_RETRIES)
+                {
+                    // Advance TX queue
+                    cmd_tx_QAdvance();
+                    cmd_tx.tx_Retry = 0;
+                    recoveryFailCount++;
+                    if(recoveryFailCount > RS422_MAX_RECOVERY_COUNT)
+                        cmd_tx.state = STATE_FAULT; 
+                    else
+                        cmd_tx.state = STATE_IDLE;
+                }
+                else
+                {
+                    //retry same packet dont advance queue
+                    cmd_tx.tx_Retry++;
+                    cmd_tx.state = STATE_IDLE;
+                }               
+            }
+            if(timerExpired(&cmd_tx.timeout_timer))
+            {
+                //If two retires fail then give up
+                if (cmd_tx.tx_Retry >= MAX_EAGLE422_RETRIES)
+                {
+                    // callback to indicate message cmd/reply was NOT successful	
+                    // Advance TX queue
+                    cmd_tx_QAdvance();
+                    cmd_tx.tx_Retry = 0;
+                    cmd_ResetRxHandler(RCV_PKT_TIMEOUT_ERROR);
+                    recoveryFailCount++;
+                    if(recoveryFailCount > RS422_MAX_RECOVERY_COUNT)
+                        cmd_tx.state = STATE_FAULT;
+                    else
+                        cmd_tx.state = STATE_IDLE;
+                }
+                else
+                {
+                    cmd_tx.tx_Retry++;
+                    cmd_tx.state = STATE_IDLE;
+                }
+            }
+            break;
+        case STATE_FAULT:
+//            eagle_config.in_ui_error_screen = 1;
+//            systemRecoveryFlag.headUartRecoveryFail = 1;
+            break;
+                
+    }
+}
+
+void debug_heat_status()
+{
+    switch(system_status.temp_heater)
+    {
+        case HTR_ERROR__LIMITTHERM:
+            system_status.heater_status = PROTECTION_MODE;
+            break;
+        case HTR_ERROR__ACMISSING:
+            system_status.heater_status = HEATER_POWER_FAULT;
+            break;
+        case HTR_ERROR__REGTHERM:
+            system_status.heater_status = CONTROL_SENSOR_FAULT;
+            break;
+        case HTR_ERROR__NOFLOW:
+            system_status.heater_status = NO_FLOW_FAULT;
+            break;
+        case HTR_ERROR__OK:
+            system_status.heater_status = NO_ERROR;
+            break;
+        default:
+            if (system_status.temp_heater != HTR_ERROR__INTESTMODE)
+            {
+                system_status.heater_status = HEATER_OTHER_ERROR;
+            }
+            break;
+    }
+}
+void Jet_Status(void)
+{
+    int i;
+    for(i=0;i<3;i++)
+    {
+        if(system_status.jet_speed[i] == SPEED_OFF)  jet_status[i].isSetOn = false;
+        else jet_status[i].isSetOn = true;
+    }
+}
+u8 ProcessRxCommand(void)
+{
+    u8 object, command;
+    u8 status;
+    u8 i;
+    u8 buffer_index;
+    char eagleVersion[16];
+    unsigned char Temp_Val = 0;
+    float Temp_Val_Dec = 0;
+                   
+    // Set initial return status
+    status = RCV_PKT_NO_ERROR;
+    
+    // Get command to process
+    object = cmd_rx.buffer[0];
+    command = cmd_rx.buffer[1];
+    
+    switch (object)
+    {
+        case OBJ_ID_01:
+            switch(command){
+                case GET_SOFTWARE_VER:
+                    for(i = 0; i< 16; i++){
+                        eagleVersion[i] = cmd_rx.buffer[i+2];
+                    }
+            strncpy((char *)&version.firmware_version_eagle, (char *)&eagleVersion,15);
+            if (version.firmware_version_eagle[0] != NULL_CHAR)
+                head_setup.hasVersion = TRUE;
+            else
+                head_setup.hasVersion = FALSE;
+            
+            break;
+                case SET_TEMPERATURE:
+                    break;
+            }
+        break;
+        
+        case OBJ_ID_02:
+            switch(command){
+                case GET_CONFIG:
+                    
+                    strcpy(eagle_config.model, (char *) "HSS HEAD");
+                    
+                    eagle_config.pump1_speeds = cmd_rx.buffer[2];
+                    eagle_config.pump2 = cmd_rx.buffer[3];
+                    eagle_config.pump2_speeds = cmd_rx.buffer[4];
+                    eagle_config.pump3_enable = cmd_rx.buffer[5];
+                    eagle_config.blower = cmd_rx.buffer[6];
+                    eagle_config.twentyfour_hour = cmd_rx.buffer[7];
+                    eagle_config.display_blanking = cmd_rx.buffer[8];
+                    eagle_config.music_features = cmd_rx.buffer[9];
+                    eagle_config.temp_display = cmd_rx.buffer[10];
+                    eagle_config.heater_concurrent = cmd_rx.buffer[11];
+                    eagle_config.blower_concurrent = cmd_rx.buffer[12];
+                    eagle_config.zone_1 = cmd_rx.buffer[13];
+                    eagle_config.zone_2 = cmd_rx.buffer[14];
+                    eagle_config.zone_3 = cmd_rx.buffer[15];
+                    eagle_config.zone_4 = cmd_rx.buffer[16];
+                    eagle_config.pump3_concurrent = cmd_rx.buffer[17];
+                    eagle_config.embedded_mzlight = cmd_rx.buffer[18];
+                    eagle_config.dispTempIn = cmd_rx.buffer[19];
+                    eagle_config.jet_timeout_a = cmd_rx.buffer[20];
+                    eagle_config.jet_timeout_b = cmd_rx.buffer[21];
+                    eagle_config.circpump_mode = cmd_rx.buffer[22];
+                    eagle_config.music_on_i2c = cmd_rx.buffer[23];
+                    eagle_config.spa_lock_enable = cmd_rx.buffer[24];
+                    eagle_config.clh_1deg_offset = cmd_rx.buffer[25];
+                    eagle_config.power_3_phase = cmd_rx.buffer[26];
+                    eagle_config.heatpump_tranquil_enable = cmd_rx.buffer[27];
+                    eagle_config.heatpump_concurrent = cmd_rx.buffer[28];
+                    eagle_config.exterior_lights = cmd_rx.buffer[29];
+                    eagle_config.limelight_highlife_spa = cmd_rx.buffer[30];
+                    eagle_config.logo_high_brightness = cmd_rx.buffer[31];
+                    eagle_config.logo_low_brightness = cmd_rx.buffer[32];
+                    eagle_config.salt_sys_power_A = cmd_rx.buffer[33];
+                    eagle_config.salt_sys_power_B = cmd_rx.buffer[34];
+                    eagle_config.auto_clarity = cmd_rx.buffer[35];
+                    eagle_config.bluetooth_XR = cmd_rx.buffer[36];
+                    eagle_config.summer_timer = cmd_rx.buffer[37];
+                    
+                    head_setup.hasSpaConfig = TRUE;
+                    
+                break;
+                case GET_GLOBAL_STATUS:
+                    break;
+                case SET_CONFIG:
+                    break;
+                case GET_GLOBAL_STATUS2:
+                    global_status_received = true;
+                    user_set.isHeaterLocked  = (cmd_rx.buffer[4] & 0x01);
+                    user_set.isSpaLock = (cmd_rx.buffer[4] & 0x02)>> 1;
+                    user_set.isSummerTimer = (cmd_rx.buffer[4] & 0x20)>> 5;
+                    global_status.is_circ_pump_on = (cmd_rx.buffer[5] & 0x04)>> 2;
+                    user_set.dispHeaterIn = (cmd_rx.buffer[15] & 0x40) >> 6;
+                   if(user_set.dispHeaterIn == DEGF)
+                   {
+                       if(cmd_rx.buffer[85] != 0x20)
+                       {
+                        Temp_Val = (u8)(cmd_rx.buffer[85]-0x30)* 100;
+                        Temp_Val += (u8)(cmd_rx.buffer[86]-0x30)* 10;
+                        Temp_Val += (u8)(cmd_rx.buffer[87]-0x30);
+                        Temp_Val_Dec = (float)Temp_Val;
+                       }
+                   }
+                   else
+                   {
+                       Temp_Val = (u8)(cmd_rx.buffer[85]-0x30)* 10;
+                       Temp_Val += (u8)(cmd_rx.buffer[86]-0x30);                       
+                       Temp_Val_Dec = (float)(cmd_rx.buffer[88]-0x30)/10;
+                       Temp_Val_Dec = Temp_Val_Dec+Temp_Val;
+                   }
+                   if(cmd_rx.buffer[132] == 1)
+                        user_set.clean24hours = 1;
+                    break;
+                    
+                case GET_ALL_VERSION:
+                    for(i = 0; i< 16; i++){
+                        eagleVersion[i] = cmd_rx.buffer[i+2];
+                    }
+                    for(i=0; i<3; i++)
+                    {
+                        fwssVersion[i] =  cmd_rx.buffer[i+31];// index offset ->31 for FWSS version
+                    }
+                    strcpy((char *)&version.firmware_version_eagle, (char *)&eagleVersion);
+                    if (version.firmware_version_eagle[0] != NULL_CHAR)
+                        head_setup.hasVersion = TRUE;
+                    else
+                        head_setup.hasVersion = FALSE;
+
+                    break;            
+                case SET_TEMPERATURE_UNIT:    
+                     if(cmd_rx.buffer[2] != ACK)
+                     {
+                         status = RCV_UNKNOWN_ERROR;
+                     }
+                break;
+            }
+            break;
+        case OBJ_ID_03:
+            switch(command){                
+                case SET_SCREEN_BRIGHTNESS:
+                {
+                    if(cmd_rx.buffer[2] != ACK)
+                    {
+                        status = RCV_UNKNOWN_ERROR;
+                    }
+                }
+                break;
+                
+                case GET_SCREEN_BRIGHTNESS:
+                {
+                    screen_brightness_received = true;
+                    user_set.brightness = cmd_rx.buffer[2];
+                    //TODO
+                    //brightness_Set(user_set.brightness);
+                }
+                break;
+            }
+        break;
+        case OBJ_ID_04:
+            switch(command){
+                case SET_LIGHTS_TIMER:
+                    user_set.lights24hours = cmd_rx.buffer[2];
+                    user_set.lights24hoursAuto = cmd_rx.buffer[3];
+//                    lights_timer.lights_timer_start_hour = cmd_rx.buffer[4];
+//                    lights_timer.lights_timer_start_minute = cmd_rx.buffer[5];
+//                    lights_timer.lights_timer_duration = cmd_rx.buffer[6];
+                    break;
+                case GET_LIGHTS_TIMER:
+                    user_set.lights24hours = cmd_rx.buffer[2];
+                    user_set.lights24hoursAuto = cmd_rx.buffer[3];
+//                    lights_timer.lights_timer_start_hour = cmd_rx.buffer[4];
+//                    lights_timer.lights_timer_start_minute = cmd_rx.buffer[5];
+//                    lights_timer.lights_timer_duration = cmd_rx.buffer[6];
+                    break;
+            }
+        break;
+        case OBJ_ID_1D:
+            switch(command){
+                case SET_HEATPUMP_MODE:
+                    heatpump_status.mode = cmd_rx.buffer[2];
+                    heatpump_status.op_mode = cmd_rx.buffer[3];
+                    heat_mode_status_received = true;
+                break;
+                case SET_HEATER_ON_OFF:
+                    if(cmd_rx.buffer[2] != ACK)
+                    {
+                        status = RCV_UNKNOWN_ERROR;
+                    }
+                    break;                    
+            }
+        break;
+        case OBJ_ID_06:
+            switch(command){
+                case SYSTEM_STATUS_CMD:   
+                    
+                    for(i=0; i<4; i++){
+                       emzlight_status.dimmer_level[i] = cmd_rx.buffer[i+2];
+                       emzlight_status.wheel_on[i] = cmd_rx.buffer[i+6];
+                       emzlight_status.color[i] = cmd_rx.buffer[i+10] - 1;
+                    }
+                    
+                    for(i=0; i<3; i++)
+                        system_status.jet_speed[i] = cmd_rx.buffer[i + 14]; 
+                    
+                    system_status.currTempF = cmd_rx.buffer[17];
+                    
+                    system_status.isFwiqInstalled = cmd_rx.buffer[19]; // fwiq
+                    system_status.fwiqError = cmd_rx.buffer[20]; //fwiq
+                    system_status.isG4Installed = cmd_rx.buffer[18];
+                    system_status.setup_switch = cmd_rx.buffer[21];
+                    system_status.temp_heater = cmd_rx.buffer[22];
+                    debug_heat_status();
+					system_status.ace_error = cmd_rx.buffer[23];
+                    system_status.chiller_error = cmd_rx.buffer[24];
+                    system_status.periph_error = cmd_rx.buffer[25];
+                    system_status.heatpump_isInstalled = cmd_rx.buffer[26];
+                    system_status.isG5Installed = cmd_rx.buffer[27];
+                    system_status.music_isInstalled = cmd_rx.buffer[29];
+                    if(system_status.music_isInstalled)
+                        music_status.isInitialized = TRUE;
+                    else
+                        music_status.isInitialized = FALSE;
+                    system_status.emzlight_isInstalled = cmd_rx.buffer[28];
+                    system_status.connextion_isInstalled = cmd_rx.buffer[30];
+                    system_status.timestamp_second = cmd_rx.buffer[31];
+                    system_status.timestamp_minute = cmd_rx.buffer[32];
+                    system_status.timestamp_hour = cmd_rx.buffer[33];
+                    system_status.timestamp_date = cmd_rx.buffer[34];
+                    system_status.timestamp_month = cmd_rx.buffer[35];
+                    system_status.timestamp_year = (cmd_rx.buffer[37] & 0xff);
+                    system_status.timestamp_year |= (cmd_rx.buffer[36] << 8);
+                    system_status.spa_rtc_is_ok = cmd_rx.buffer[38];
+                    
+                    head_setup.hasSystemStatus = TRUE;
+                    //protection mode parameters
+                    protection_mode.spaStatusPinPressSwPrev3 = cmd_rx.buffer[39];
+                    protection_mode.spaStatusPinPressureSwitch = cmd_rx.buffer[40];
+                    protection_mode.spaStatusIsPressureSwClosed = cmd_rx.buffer[41];
+                    if(system_status.heater_status == 1) //1 = HTR_ERROR__LIMITTHERM
+                        protection_mode.ilocActive = 1;
+                    global_status.is_circ_pump_on = cmd_rx.buffer[43];
+                    protection_mode.limitTempF = cmd_rx.buffer[44];
+                    protection_mode.thermistorsPcbTempF = cmd_rx.buffer[45];
+                    protection_mode.powersensePrev3ampsHeater = cmd_rx.buffer[46];
+                    protection_mode.powersensePrev3ampsJet1_2 = cmd_rx.buffer[47];
+                    protection_mode.spa_statusPerifShortDetected = cmd_rx.buffer[48];
+
+                    system_status.jetIsCleanMode = cmd_rx.buffer[49];
+                    system_status.jetIsJetsSoftenWater = cmd_rx.buffer[50];
+                    ace_status.cart_installed = cmd_rx.buffer[52];
+                    heater_status.isSetOn = cmd_rx.buffer[53];
+                    user_set.timestamp_time_format = cmd_rx.buffer[54];
+                    eagle_config.in_service_screen = system_status.setup_switch;
+                    
+//                    heatEcocycle_0.state = cmd_rx.buffer[51];   //51//HeaterEcoModeIsOn(ECO_MODE0)
+//                    heatEcocycle_0.state = cmd_rx.buffer[55] & 0x01; //55
+//                    heatEcocycle_1.state = (cmd_rx.buffer[55]>>1) & 0x01; //55
+//                    heatEcocycle_2.state = (cmd_rx.buffer[55]>>2) & 0x01; //55
+                    
+                    ace_status.ten_day_count = cmd_rx.buffer[56];
+                    ace_status.block_reminder = cmd_rx.buffer[57];
+                    ace_status.block_eol_error = cmd_rx.buffer[58];
+                    ace_status.error_code = cmd_rx.buffer[59];
+                    ace_status.error_flags = cmd_rx.buffer[60];
+                    ace_status.salt_value = cmd_rx.buffer[61];
+                    ace_status.salt_level = cmd_rx.buffer[62];
+                    heatpump_status.isOn = cmd_rx.buffer[63];
+
+                    eagle_config.in_service_screen = system_status.setup_switch;
+                    set_temperature = cmd_rx.buffer[64];
+                    if(user_set.dispHeaterIn == DEGC)
+                    {
+                        set_temperature = (float)((((float)(cmd_rx.buffer[69]))/100)+cmd_rx.buffer[64]);
+                        Temp_Val_Dec = f_to_c_conversion(set_temperature); // convert to nearest 0.5 degree step in Celsius
+                    }
+//                    seg3_logolight_detected = cmd_rx.buffer[65];   
+                    system_status.isBlowerOn = cmd_rx.buffer[66];
+                    
+                    Jet_Status();                 
+                break;
+            }
+            break;
+        case OBJ_ID_0B:
+            switch(command){
+                case SET_JET1:
+                    system_status.jet_speed[0] = cmd_rx.buffer[2];
+                    break;
+                case SET_JET2:
+                    system_status.jet_speed[1] = cmd_rx.buffer[2];
+                    break;
+                case SET_JET3:
+                    system_status.jet_speed[2] = cmd_rx.buffer[2];
+                    break;
+                case SET_BLOWER:
+//                    system_status.isBlowerOn = cmd_rx.buffer[2];
+                    break;
+                case SET_SUMMER_TIMER:
+                    break;
+                case SET_SPA_LOCK:
+                    break;
+                case SET_TEMPERATURE_LOCK:
+                    break;
+                case SET_CLEAN_MODE:
+                    if(cmd_rx.buffer[2] == 1)
+                    {
+                        system_status.jetIsCleanMode = 1;
+                    }
+                    else if(cmd_rx.buffer[2] == 0)
+                    {
+                        system_status.jetIsCleanMode = 0;
+                    }
+                    else
+                        status = RCV_UNKNOWN_ERROR;
+                    break;
+                case SET_CLEAN_DAILY:
+                    if(cmd_rx.buffer[2] == 0)
+                    {
+                      user_set.clean24hours = 0;
+                    }
+                    else if(cmd_rx.buffer[2] == 1)
+                    {
+                        user_set.clean24hours = 1;
+                        system_status.jetIsCleanMode = 0;
+                    }
+                    else if(cmd_rx.buffer[2] == 2)
+                    {
+                        user_set.clean24hours = 1;
+                        system_status.jetIsCleanMode = 1;
+                    }
+                    else if (cmd_rx.buffer[2] == 3)
+                    {
+                        cleancycle_status.clean_cycle_start_hours = cmd_rx.buffer[3];
+                        cleancycle_status.clean_cycle_start_minutes = cmd_rx.buffer[4];
+                        if(cmd_rx.buffer[5] == 1)
+                        {
+                            user_set.clean24hours = 1;
+                            system_status.jetIsCleanMode = 0;
+                        }
+                        else if(cmd_rx.buffer[6] == 2)
+                        {
+                            user_set.clean24hours = 1;
+                            system_status.jetIsCleanMode = 1;
+                        }   
+                    }
+                    if((cmd_rx.buffer[2] > 3)||(cmd_rx.buffer[2]<0))
+                        status = RCV_UNKNOWN_ERROR;
+                    break;
+                case GET_CLEAN_SETTINGS:
+                    system_status.jetIsCleanMode = cmd_rx.buffer[2];
+                    user_set.clean24hours = cmd_rx.buffer[3];
+                    cleancycle_status.clean_cycle_start_hours = cmd_rx.buffer[4];
+                    cleancycle_status.clean_cycle_start_minutes = cmd_rx.buffer[5];
+                    break;
+            }
+            break;
+        case OBJ_ID_17:
+            switch(command){
+                case MZ_LIGHT_COMMAND:
+                    if(cmd_rx.buffer[2] != ACK)
+                    {
+                        status = RCV_UNKNOWN_ERROR;
+                    }
+                    break;
+                case MZ_LIGHT_STATUS:
+                    user_set.lights24hours = cmd_rx.buffer[2];
+                    for(i=0; i<4; i++){
+                       emzlight_status.dimmer_level[i] = cmd_rx.buffer[i+3];
+                       emzlight_status.wheel_on[i] = cmd_rx.buffer[i+7];
+                       emzlight_status.wheel_loop_speed[i] = cmd_rx.buffer[i+11];
+                       emzlight_status.color[i] = cmd_rx.buffer[i+15];
+                    }
+                    Lights_Status_received = true;
+                    break;
+            }
+        break;
+    }
+    return status;
+}
+/*******************************************************************************
+ * Function Name  : cmdHandler()
+ * Description    : command processing
+ * Input          : None
+ * Output         : None
+ * Return         : None
+ ******************************************************************************/
+void cmdHandler()
+{
+//    u8 reset_status;
+//    u16 index;
+//    static u8 i;
+//
+//    // if a packet is ready for processing
+//    if (cmd_rx.state == RCV_PKT_READY)
+//    {
+//        comm_detected = TRUE;
+//        // assume no error in received packet
+//        reset_status = RCV_PKT_NO_ERROR;
+//        // select command to process
+//        switch (cmd_rx.buffer[0])
+//        {
+//            case CMD_ON:
+//                // process command & acknowledge
+//                pwm_onoff(1);
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_OFF:
+//                // process command & acknowledge
+//                pwm_onoff(0);
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_SET_LED:
+//                // process command & acknowledge
+//                if (cmd_rx.buffer[2] == 0) // OFF
+//                    iconledClear(cmd_rx.buffer[1]);
+//                else // ON
+//                    iconledSet(cmd_rx.buffer[1]);
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_WRITE_TEXT:
+//                // process command & acknowledge
+//                index = cmd_rx.payload_size - 1;
+//                cmd_rx.buffer[index] = 0; // 0 at end of string
+//                charledsSet((char *) &cmd_rx.buffer[1]);
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_CLEAR_SCREEN:
+//                // process command & acknowledge
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_GET_FW_VERSION:
+//                // process command & acknowledge
+//                txPayload_PutByte(0, SLAVE_FW_VERSION);
+//                txPayload_PutROMString(1, VERSION);
+//                break;
+//
+//            case CMD_GET_DEVICE:
+//                pinSet(LCD_BL_EN);  // turn on LCD backlight
+//                pinSet(SW_BL_EN);   // turn on switch backlights
+//                // process command & acknowledge
+//                txPayload_PutByte(0, SLAVE_DEVICE_TYPE);
+//                txPayload_PutROMString(1, DEVICE_TYPE_HAWK);
+//                break;
+//
+//            case CMD_GET_KEYIMAGE:
+//                // process command
+//                for (i = 0; i < NUM_ICONS; i++)
+//                {
+//                    if (i > 7)
+//                    {
+//                        if (cmd_rx.buffer[1] & 0x01)
+//                            iconledSet(i);
+//                        else
+//                            iconledClear(i);
+//                        cmd_rx.buffer[1] >>= 1;
+//                    }
+//                    else
+//                    {
+//                        if (cmd_rx.buffer[2] & 0x01)
+//                            iconledSet(i);
+//                        else
+//                            iconledClear(i);
+//                        cmd_rx.buffer[2] >>= 1;
+//                    }
+//                }
+//                // acknowledge
+//                txPayload_PutByte(0, SLAVE_KEY_IMAGE);
+//                txPayload_PutWord(1, key_image);
+//                break;
+//
+//            case CMD_SET_BRIGHTNESS:
+//                // process command & acknowledge
+////                brightness = cmd_rx.buffer[1];
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_CLOCK_CAL:
+//                // process command & acknowledge
+//                sys_clock_cal = cmd_rx.buffer[1];
+//                sys_clock_cal <<= 8; // get msd clock calibration value
+//                sys_clock_cal += cmd_rx.buffer[2]; // get lsd clock calibration value
+//                cal_time_flag = 1;
+//                txPayload_PutByte(0, ACK_CHAR);
+//                break;
+//
+//            case CMD_FLIP_DISPLAY_IMAGE:
+//                if (text_invert >= 1) text_invert = 0;
+//                else text_invert = 1;
+//                break;
+//
+//            default:
+//                txPayload_PutByte(0, ACK_CHAR);
+//                reset_status = RCV_PKT_UNRECOGNIZED_CMD;
+//        }
+//        handle_count++; // *** DEBUG ***
+//        txSendPacket(MASTER_ADDRESS); // send response
+//        reset_rx_handler(reset_status); // reset handler
+//    }
+//    else if (cmd_rx.state > RCV_STX && timerExpired(&cmd_rx.timeout_timer))
+//    {
+//        reset_rx_handler(RCV_PKT_TIMEOUT_ERROR);
+//    }
+}
+
+/*******************************************************************************
+ * Function Name  : cmd_RxHandler()
+ * Description    : processing of received character per the
+ *                  command protocol
+ * Input          : None
+ * Output         : None
+ * Return         : None
+ *******************************************************************************/
+int cmd_RxHandler(u8 rx_byte)
+{
+    int return_value = 0;
+    switch (cmd_rx.state)
+    {
+        case RCV_STX:
+            if (rx_byte == PREAMBLE_422)
+            {
+                cmd_rx.state = RCV_TO_ADDRESS;
+            }
+            else 
+                cmd_ResetRxHandler(RCV_START_ERROR);
+            break;
+
+        case RCV_TO_ADDRESS:
+            if (rx_byte == MY_ADDRESS)
+            {
+                cmd_rx.calc_crc = rx_byte;
+                cmd_rx.state = RCV_FROM_ADDRESS;
+                timerInit(&cmd_rx.timeout_timer, EXPECTED_RESPONSE_TIME);
+            }
+            else 
+                cmd_ResetRxHandler(RCV_DEST_ERROR);
+            break;
+
+        case RCV_FROM_ADDRESS:
+            if (rx_byte == EAGLE_ADDRESS)
+            {
+                cmd_rx.calc_crc += rx_byte;
+                cmd_rx.state = RCV_PAYLOAD_SIZE;
+            }
+            else 
+                cmd_ResetRxHandler(RCV_FROM_ERROR);
+            break;
+
+        case RCV_PAYLOAD_SIZE:
+            cmd_rx.calc_crc += rx_byte;
+            cmd_rx.payload_size = rx_byte;
+            cmd_rx.state = RCV_FLAG;
+            cmd_rx.data_len = 0;
+
+            // check limits of payload length
+            if (cmd_rx.payload_size == 0) 
+                cmd_rx.state = RCV_CRC;
+            else if (cmd_rx.payload_size > UART_MAX_RX_BUF_SIZE) 
+                cmd_ResetRxHandler(RCV_PAYLOAD_SIZE_ERROR);
+            break;
+
+        case RCV_FLAG:
+            cmd_rx.calc_crc += rx_byte;
+            if(rx_byte == RESPONSE_FLAG || rx_byte == REQUEST_FLAG)
+                cmd_rx.state = RCV_PAYLOAD_DATA;
+            else 
+                cmd_ResetRxHandler(RCV_FRAMING_ERROR);
+            break;
+            
+        case RCV_PAYLOAD_DATA:
+            cmd_rx.calc_crc += rx_byte;
+            cmd_rx.buffer[cmd_rx.data_len++] = rx_byte;
+            if (cmd_rx.data_len >= (cmd_rx.payload_size)) 
+                cmd_rx.state = RCV_CRC;
+            break;
+
+        case RCV_CRC:
+            cmd_rx.crc += rx_byte;
+            cmd_rx.calc_crc = ~(cmd_rx.calc_crc);
+            // test received CRC against calculated CRC
+            if (cmd_rx.crc == cmd_rx.calc_crc || cmd_rx.use_crc_check == FALSE)
+            {
+                cmd_rx.state = RCV_PKT_READY;
+            } 
+            else 
+                cmd_ResetRxHandler(RCV_CRC_ERROR);
+            break;
+
+        case RCV_PKT_READY:
+            return_value = 1;
+            break;
+
+        default:
+            break;
+    }
+    return return_value;
+}
+
+///*******************************************************************************
+// * Function Name  : rxPayload_GetInt()
+// * Description    : command processing
+// * Input          : None
+// * Output         : None
+// * Return         : None
+// ******************************************************************************/
+//u16 rxPayload_GetInt(u16 byte_index)
+//{
+//    u16 little_endian;
+//
+//    little_endian = (u16)(cmd_rx.buffer[byte_index] << 8 | cmd_rx.buffer[byte_index + 1]);
+//
+//    return ( little_endian);
+//}
+//
+///*******************************************************************************
+// * Function Name  : rxPayload_GetByte()
+// * Description    : gets byte from rxPayload
+// * Input          : byte_index
+// * Output         : None
+// * Return         : byte at cmd_rx.buffer[byte_index]
+// ******************************************************************************/
+//u16 rxPayload_GetByte(u16 byte_index)
+//{
+//    return ( cmd_rx.buffer[byte_index]);
+//}
+//
+///*******************************************************************************
+// * Function Name  : txPayload_PutWord()
+// * Description    : puts word in txPayload  (MSB, LSB)
+// * Input          : byte_index, word to be put in payload
+// * Output         : None
+// * Return         : None
+// ******************************************************************************/
+//void txPayload_PutWord(u16 byte_index, u16 word_out)
+//{
+//    txPayload_PutByte(byte_index, word_out >> 8);
+//    txPayload_PutByte(byte_index + 1, word_out & 0xFF);
+//}
+//
+///*******************************************************************************
+// * Function Name  : txPayload_PutByte()
+// * Description    : puts byte in txPayload
+// * Input          : byte_index, byte to be put in payload
+// * Output         : None
+// * Return         : None
+// ******************************************************************************/
+//void txPayload_PutByte(u16 byte_index, u8 byte_out)
+//{
+//    cmd_tx.buffer[PAYLOAD_OFFSET + byte_index] = byte_out;
+//
+//    if (cmd_tx.payload_size <= byte_index)
+//        cmd_tx.payload_size = byte_index + 1;
+//}
+//
+///*******************************************************************************
+// * Function Name  : txPayload_PutString()
+// * Description    : puts string in txPayload
+// * Input          : byte_index, pointer to string
+// * Output         : None
+// * Return         : None
+// ******************************************************************************/
+//void txPayload_PutString(u16 byte_index, char *sptr)
+//{
+//    strcpy((char *) &cmd_tx.buffer[PAYLOAD_OFFSET + byte_index], sptr);
+//
+//    byte_index += strlen(sptr);
+//
+//    if (cmd_tx.payload_size <= byte_index)
+//        cmd_tx.payload_size = byte_index + 1;
+//}
+//
+///*******************************************************************************
+// * Function Name  : txPayload_PutString()
+// * Description    : puts string in txPayload
+// * Input          : byte_index, pointer to string
+// * Output         : None
+// * Return         : None
+// ******************************************************************************/
+//void txPayload_PutROMString(u16 byte_index, const char *sptr)
+//{
+//    byte_index += strlen((char *) &cmd_tx.buffer[PAYLOAD_OFFSET + byte_index]);
+//
+//    if (cmd_tx.payload_size <= byte_index)
+//        cmd_tx.payload_size = byte_index + 1;
+//}
+
+/*******************************************************************************
+ * Function Name  : cmd_ResetRxHandler()
+ * Description    : resets processing for received character
+ * Input          : status byte
+ * Output         : None
+ * Return         : None
+ *******************************************************************************/
+void cmd_ResetRxHandler(u8 status)
+{
+    /* for debugging */
+    cmd_rx.reason_for_reset = status;
+    
+    if ( (status >= RCV_START_ERROR && status < RCV_PKT_NO_ERROR) || 
+            status == RCV_PKT_UNRECOGNIZED_CMD )
+        //instrumentation.head_rs422_rx_fail++;
+        
+    /* reset rcv state to RCV_STX */
+    cmd_rx.state = RCV_STX;
+    cmd_rx.data_len = 0;
+    cmd_rx.crc = 0;
+    cmd_rx.ptr = cmd_rx.buffer; /* Put data in cmd_buffer[MAX_PAYLOAD_LEN] */
+}
+
+u16 cmd_txSendPacket(eagle_msg_type msg_type, char dest_adr, char object, char cmd, 
+                      const void *data_ptr, unsigned int data_len)
+{
+    static char eagle_buffer[MAX_EAGLE422_MSGS_SIZE];
+    // Do not send packets when Head detects a communication problem
+    if (1/*head_setup.noUpdateResponseFromEagle == FALSE*/)
+    {
+        union 
+        {
+            struct 
+            {
+                unsigned char lsd;
+                unsigned char msd;
+            };
+            struct 
+            {
+                unsigned int word;
+            };
+        } temp_len;
+    
+        temp_len.word = data_len + MIN_PAYLOAD_LEN; // save for byte-access to word, add in OBJ and CMD byte length
+        
+        eagle_buffer[PREAMBLE_INDEX] = PREAMBLE_422;           // start of tranmission character
+        eagle_buffer[DEST_ADR_INDEX] = dest_adr;               // destination address
+        eagle_buffer[SRC_ADR_INDEX] = MY_ADDRESS;              // source address
+        eagle_buffer[PAYLOAD_LEN_INDEX] = temp_len.lsd;        //payload size in bytes
+        
+        if(msg_type == EAGLE_REQUEST)
+            eagle_buffer[FLAGS_INDEX] = REQUEST_FLAG | (PROTOCOL_VERSION_MASK & temp_len.msd);
+        else
+            eagle_buffer[FLAGS_INDEX] = RESPONSE_FLAG | (PROTOCOL_VERSION_MASK & temp_len.msd);         //flag to specify response/cmd 
+                              
+        eagle_buffer[OBJ_INDEX] = object;                      //Data Objective
+        eagle_buffer[CMD_INDEX] = cmd;                         //Data Command
+        memcpy(&eagle_buffer[DATA_INDEX], data_ptr, data_len); //Data 
+        eagle_buffer[data_len + 7] = 
+                eagle485_Checksum(&eagle_buffer[DEST_ADR_INDEX],
+                ((DATA_INDEX - DEST_ADR_INDEX) + data_len));    //CRC Calculation
+        cmd_tx.payload_size = data_len;
+        // Send packet
+        cmd_txSendQueue((u8 *) eagle_buffer,cmd_tx.payload_size + EAGLE422_FRAME_SIZE);
+    }
+
+    return (1);
+}
+
+/*******************************************************************************
+ * Function Name  : cmd_txSendPacket()
+ * Description    : Assumes payload already in buffer. Adds header bytes,
+ *                  addressing info, and CRC. Sends completed packet to device
+ * Input          : device address
+ * Output         : None
+ * Return         : 1 ?
+ *******************************************************************************/
+char eagle485_Checksum(const char *ptr, unsigned int len)
+{
+    char sum;
+    unsigned int cnt;
+
+    sum = 0;
+    for (cnt = 0; cnt < len; ++cnt)
+        sum += ptr[cnt];
+
+    return ~sum;
+}
+
+u16 cmd_txSendQueue(unsigned char *ptr, int len)
+{
+    eagle_tx_queue[cmd_tx.tx_Qin][0] = ((len >> 8) & 0xFF);
+    eagle_tx_queue[cmd_tx.tx_Qin][1] = (len & 0xFF);
+    memcpy(&eagle_tx_queue[cmd_tx.tx_Qin][2], ptr, len);
+    cmd_tx.tx_Qin = (cmd_tx.tx_Qin + 1) < MAX_EAGLE422_MSGS ? cmd_tx.tx_Qin + 1 : 0;
+    return 0;
+}
+
+unsigned char *cmd_tx_QPop(unsigned int *len)
+{
+    unsigned char *ptr;
+    
+    *len = (eagle_tx_queue[cmd_tx.tx_Qout][0] << 8) | (eagle_tx_queue[cmd_tx.tx_Qout][1]) ;
+    ptr = &eagle_tx_queue[cmd_tx.tx_Qout][2];
+    return (ptr);
+}
+
+void cmd_tx_QAdvance(void)
+{
+    cmd_tx.tx_Qout = (cmd_tx.tx_Qout + 1) < MAX_EAGLE422_MSGS ? cmd_tx.tx_Qout + 1 : 0;
+}
+
+int cmd_XmitDone(void)
+{
+    cmd_tx.state = 1;
+    return 1;
+}
+
+???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+/*******************************************************************************
+ * File Name      : uart2.c
+ * Description    : routines to handle PIC32 uart2
+ *
+ *     $Archive:  /chip/ $
+ *     $Author:   Jeff McFarland, John Keenan, Synergy Electronics Inc. $
+ *     $Date:     1/11/11 $
+ *     $Revision: 1.0 $
+ *     $History:  Original $
+ *
+ * Modified 1/27/2012- Larry Nicholson
+ *
+
+ *******************************************************************************/
+/* Includes ------------------------------------------------------------------*/
+#include <xc.h>
+#include "standardtypes.h"
+#include "memory.h"
+#include "cmdhandler.h"
+#include "uart.h"
+
+/* Private typedef -----------------------------------------------------------*/
+/* Private define ------------------------------------------------------------*/
+#define BAUD_115200 34  // at 16MHz
+#define LOW_PRIORITY_INTERRUPT  0
+#define HIGH_PRIORITY_INTERRUPT 1
+/* Private macro -------------------------------------------------------------*/
+/* Private variables ---------------------------------------------------------*/
+stUART uart0;
+unsigned char framing_error;
+unsigned char uart_reset_request;
+
+/********************************************************************
+ * Function Name  : Uart Rcv Interrupt
+ * Description    : Recevie bytes upon new character.
+ * Input          : None
+ * Return         : None
+ ************************************************************************/
+static void UART_ISR_TX_Handler(void);
+static void UART_ISR_RX_Handler(void);
+
+void __interrupt(low_priority) UART2_Interrupt(void)
+{
+    if (PIR3bits.RC2IF)
+    {
+        UART_ISR_RX_Handler();
+    }
+    else if(PIR3bits.TX2IF == 1)
+    {
+        PIR3bits.TX2IF = 0;
+        //transmission interrupt handle
+        UART_ISR_TX_Handler();
+    }
+}
+
+static void UART_ISR_RX_Handler(void)
+{
+    //reception interrupt handle
+    PIR3bits.RC2IF = 0;
+    if(RCSTA2bits.FERR)
+    {
+        //TODO
+        //reset uart
+    }
+    if(RCSTA2bits.OERR)
+    {
+        RCSTA2bits.CREN = 0;
+        RCSTA2bits.CREN = 1;
+    }
+
+    if (uart0.rx_in_ptr != NULL)
+    {
+        // read the register
+        *uart0.rx_in_ptr = RCREG2;
+        
+        //Increment the circular buffer index
+        if (++uart0.rx_in_ptr >= (uart0.rx_buf + uart0.rx_buf_size)) uart0.rx_in_ptr = uart0.rx_buf;
+        
+        //timerInit(&tmrUartIdleLine, uart0.idle_line_timeout);
+    } 
+}
+
+int uart0_send(unsigned char *ptr, int len, tx_func_ptr callback)
+{
+    if (uart0.tx_sending == true && uart0.tx_complete == false) return (0);
+
+    uart0.tx_sending = true;
+    uart0.tx_complete = false;
+    uart0.tx_out_ptr = ptr;
+    uart0.tx_out_remaining = len;
+    uart0.tx_callback = callback;
+    
+    // Start transmission
+    TXREG2 = *uart0.tx_out_ptr;
+    
+    uart0.tx_out_remaining--;
+    
+    // Enable TX interrupt
+    PIE3bits.TX2IE = 1;
+   
+    return (len);
+}
+
+static void UART_ISR_TX_Handler(void)
+{
+    // only proceed if we're supposed to be sending
+    if (uart0.tx_sending)
+    {
+        // Fill TX FIFO
+        // If the TX_LIST node has more data to transmit, write the next byte to the UART.
+        if (uart0.tx_out_remaining)
+        {
+            uart0.tx_out_ptr++;
+            // Write byte to register
+            TXREG2 = *uart0.tx_out_ptr;
+            uart0.tx_out_remaining--;
+                
+            //timerInit(&tmrUartIdleLine, uart0.idle_line_timeout);
+        }
+        else
+        {
+            PIE3bits.TX2IE = 0;                      //disable TX Interrupt once complete packet sent
+            PIE3bits.RC2IE = 1;                      //enable RX interrupt
+            uart0.tx_complete = true;
+        }
+    }
+    return;
+}
+
+/*******************************************************************************
+ * Function Name  : uart2_init( void )
+ * Description    : Initializes UART1
+ *                  Upon exit from this function, all other module entrypoints
+ *                  may be freely called.
+ * Input          : None
+ * Return         : None
+ *******************************************************************************/
+void uart2_init(void)
+{
+    //disable interrupts
+    PIE3bits.RC2IE = 0; 
+    PIE3bits.TX2IE = 0;
+    
+    //MCC generated configuration
+    BAUDCON2 = 0x48; 
+    //RX9D 0x0; OERR no_error; FERR no_error; ADDEN disabled; CREN enabled; SREN disabled; RX9 8-bit; SPEN enabled; 
+    RCSTA2 = 0x90; 
+    //TX9D 0x0; TRMT TSR_empty; BRGH hi_speed; SENDB sync_break_complete; SYNC asynchronous; TXEN enabled; TX9 8-bit; CSRC client_mode; 
+    TXSTA2 = 0x26; 
+    //SPBRGL 34; 
+    SPBRG2 = 0x22; 
+    //SPBRGH 0; 
+    SPBRGH2 = 0x0; 
+    
+    //interrupt priority level low
+    IPR3bits.RC2IP = 0;    
+    IPR3bits.TX2IP = 0;    
+    //uart2 reception interrupt enable
+    PIE3bits.RC2IE = 1; 
+}
+
+/*******************************************************************************
+ * Function Name  : register_uart2_rx(charparm_func_ptr callback)
+ * Description    : Registers the function pointed to by the CALLBACK passed
+ *                  to be called with each byte received.
+ *                  The CALLBACK will be called from the background loop
+ *                  (from UART1_MONITOR), not from the Rx interrupt handler.
+ * Input          : None
+ * Return         : None
+ *******************************************************************************/
+
+void register_uart2_rx(rx_func_ptr callback, unsigned char *buffer, int buffer_size)
+{
+    uart0.rx_buf = buffer;
+    uart0.rx_in_ptr = uart0.rx_buf;
+    uart0.rx_out_ptr = uart0.rx_buf;
+    uart0.rx_buf_size = buffer_size;
+    uart0.rx_callback = callback;
+}
+
+/*******************************************************************************
+ * Function Name  : uart2_monitor( void )
+ * Description    : Distributes new data from rx_buf and watches for the
+ *                  completion of UART transmissions.
+ * Input          : None
+ * Return         : None
+ *******************************************************************************/
+void uart2_monitor(void)
+{
+    int rx_break_loop = false;
+
+    // If new data has been received into rx_buf,
+    // mon_rx_index and int_rx_index will differ,
+    while ((uart0.rx_out_ptr != uart0.rx_in_ptr) && rx_break_loop == false)
+    {
+        // if valid callback function
+        if (uart0.rx_callback != NULL)
+        {
+            // pass it the latest received byte, rx_break = 1 on packet received
+            rx_break_loop = uart0.rx_callback(*uart0.rx_out_ptr);
+
+            if (++uart0.rx_out_ptr >= (uart0.rx_buf + uart0.rx_buf_size)) uart0.rx_out_ptr = uart0.rx_buf;
+        }
+    }
+
+    // If a message is being transmitted, see if it has completed.
+    if (uart0.tx_sending)
+    {
+        //A message has completed transmission when the interrupt handler
+        // sets the TX_COMPLETE flag and calls back to application
+        if (uart0.tx_complete)
+        {
+            uart0.tx_sending = false;
+            if (uart0.tx_callback != NULL) uart0.tx_callback();
+        }
+    }
+}
+
